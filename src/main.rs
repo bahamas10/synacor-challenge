@@ -1,4 +1,4 @@
-/**
+/*!
  * My implementation of the 2012 Synacor VM Challenge.
  *
  * Author: Dave Eddy <ysap@daveeddy.com>
@@ -6,38 +6,99 @@
  * License: MIT
  */
 
+use log::{debug, trace};
 use std::env;
 use std::fs;
-use log::{debug, trace};
 
+#[derive(Default)]
 struct VM {
-    rom: Vec<u8>,
+    ram: Vec<u8>,
     registers: [u16; 8],
     ptr: u16,
+    stack: Vec<u16>,
     running: bool,
+}
+
+enum ValueType {
+    Register(u16),
+    Literal(u16),
 }
 
 #[allow(dead_code)]
 impl VM {
     fn new(rom: Vec<u8>) -> Self {
-        Self { rom, registers: [0; 8], ptr: 0, running: true }
+        Self { ram: rom, running: true, ..Default::default() }
+    }
+
+    fn push_stack(&mut self, value: u16) {
+        debug!("pushing {} onto the stack", value);
+        self.stack.push(value);
+    }
+
+    fn pop_stack(&mut self) -> u16 {
+        self.stack.pop().expect("stack was empty")
     }
 
     fn dump_state(&self) {
-        println!("loaded rom of size {}", self.rom.len());
+        println!("loaded rom of size {}", self.ram.len());
         for (i, register) in self.registers.iter().enumerate() {
             println!("register {}: {}", i, register);
         }
+        // TODO dump stack
         println!("running={}, ptr={}", self.running, self.ptr);
     }
 
+    fn get_ram(&self, ptr: u16) -> u16 {
+        let low = self.ram[ptr as usize] as u16;
+        let high = self.ram[ptr as usize + 1] as u16;
+
+        let num = (high << 8) + low;
+        trace!(
+            "self.get_ram: ptr={} (low={} high={}) num={}",
+            ptr, low, high, num
+        );
+
+        num
+    }
+
+    // get the raw number from the rom
+    fn get_ram_value(&self, ptr: u16) -> ValueType {
+        let num = self.get_ram(ptr);
+
+        if num < 32768 {
+            // it's a literal value
+            ValueType::Literal(num)
+        } else if num < 32776 {
+            // it's a register
+            ValueType::Register(num % 32768)
+        } else {
+            // it's invalid
+            panic!("get_value found invalid number at ptr {}: {}", ptr, num);
+        }
+    }
+
+    // get the register at the pointer - fails if not a register
+    fn get_register(&self, ptr: u16) -> u16 {
+        match self.get_ram_value(ptr) {
+            ValueType::Register(n) => n,
+            ValueType::Literal(_) => panic!(),
+        }
+    }
+
+    // get the value at the pointer - either grabbing the literal value or
+    // traversing into the register itself and using that value
     fn get_value(&self, ptr: u16) -> u16 {
-        let low = self.rom[ptr as usize] as u16;
-        let high = self.rom[ptr as usize + 1] as u16;
+        match self.get_ram_value(ptr) {
+            ValueType::Register(r) => self.registers[r as usize],
+            ValueType::Literal(n) => n,
+        }
+    }
 
-        trace!("get_value = low={}, high={}", low, high);
-
-        (high << 8) + low
+    // jump to an ADDRESS
+    fn jump(&mut self, addr: u16) {
+        let ptr = addr * 2;
+        debug!("self.jump: jumping to addr {} (ptr={})", addr, ptr);
+        self.ptr = ptr;
     }
 
     fn step(&mut self) {
@@ -51,15 +112,18 @@ impl VM {
                 // halt
                 // stop execution and terminate the program
                 trace!("ptr={}: halt", self.ptr);
+
                 self.running = false;
             }
             1 => {
                 // set: 1 a b
                 // set register <a> to the value of <b>
                 trace!("ptr={}: set", self.ptr);
-                let a = self.get_value(self.ptr + 2);
+
+                let a = self.get_register(self.ptr + 2);
                 let b = self.get_value(self.ptr + 4);
-                self.registers[(a % 32768) as usize] = b;
+
+                self.registers[a as usize] = b;
 
                 debug!("set reg {} to {}", a, b);
 
@@ -68,92 +132,237 @@ impl VM {
             2 => {
                 // push: 2 a
                 // push <a> onto the stack
-                unimplemented!()
+                trace!("ptr={}: push", self.ptr);
+
+                let a = self.get_value(self.ptr + 2);
+                self.push_stack(a);
+
+                self.ptr += 4;
             }
             3 => {
                 // pop: 3 a
                 // remove the top element from the stack and write it into <a>;
                 // empty stack = error
-                unimplemented!()
+                trace!("ptr={}: push", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let elem = self.pop_stack();
+
+                self.registers[a as usize] = elem;
+
+                self.ptr += 4;
             }
             4 => {
                 // eq: 4 a b c
                 // set <a> to 1 if <b> is equal to <c>; set it to 0 otherwise
-                unimplemented!()
+                trace!("ptr={}: eq", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                if b == c {
+                    self.registers[a as usize] = 1;
+                } else {
+                    self.registers[a as usize] = 0;
+                }
+
+                self.ptr += 8;
             }
             5 => {
                 // gt: 5 a b c
                 // set <a> to 1 if <b> is greater than <c>; set it to 0 otherwise
-                unimplemented!()
+                trace!("ptr={}: gt", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                if b > c {
+                    self.registers[a as usize] = 1;
+                } else {
+                    self.registers[a as usize] = 0;
+                }
+
+                self.ptr += 8;
             }
             6 => {
                 // jmp: 6 a
                 // jump to <a>
-                unimplemented!()
+                trace!("ptr={}: jmp", self.ptr);
+
+                let a = self.get_value(self.ptr + 2);
+
+                self.jump(a);
             }
             7 => {
                 // jt: 7 a b
                 // if <a> is nonzero, jump to <b>
-                unimplemented!()
+                trace!("ptr={}: jt", self.ptr);
+
+                let a = self.get_value(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+
+                if a != 0 {
+                    debug!("jt jumped to {}", b);
+                    self.jump(a);
+                } else {
+                    self.ptr += 6;
+                }
             }
             8 => {
                 // jf: 8 a b
                 // if <a> is zero, jump to <b>
-                unimplemented!()
+                trace!("ptr={}: jf", self.ptr);
+
+                let a = self.get_value(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+
+                if a == 0 {
+                    debug!("jf jumped to {}", b);
+                    self.jump(b);
+                } else {
+                    self.ptr += 6;
+                }
             }
             9 => {
                 // add: 9 a b c
                 // assign into <a> the sum of <b> and <c> (modulo 32768)
-                unimplemented!()
+                trace!("ptr={}: add", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                let sum = (b + c) % 32768;
+                self.registers[a as usize] = sum;
+
+                self.ptr += 6;
             }
             10 => {
                 // mult: 10 a b c
                 // store into <a> the product of <b> and <c> (modulo 32768)
-                unimplemented!()
+                trace!("ptr={}: mult", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                let sum = (b * c) % 32768;
+                self.registers[a as usize] = sum;
+
+                self.ptr += 6;
             }
             11 => {
                 // mod: 11 a b c
                 // store into <a> the remainder of <b> divided by <c>
-                unimplemented!()
+                trace!("ptr={}: mod", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                let sum = (b % c) % 32768;
+                self.registers[a as usize] = sum;
+
+                self.ptr += 6;
             }
             12 => {
                 // and: 12 a b c
                 // stores into <a> the bitwise and of <b> and <c>
-                unimplemented!()
+                trace!("ptr={}: and", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                let sum = (b & c) % 32768;
+                self.registers[a as usize] = sum;
+
+                self.ptr += 6;
             }
             13 => {
                 // or: 13 a b c
                 // stores into <a> the bitwise or of <b> and <c>
-                unimplemented!()
+                trace!("ptr={}: or", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+                let c = self.get_value(self.ptr + 6);
+
+                let sum = (b | c) % 32768;
+                self.registers[a as usize] = sum;
+
+                self.ptr += 6;
             }
             14 => {
                 // not: 14 a b
                 // stores 15-bit bitwise inverse of <b> in <a>
-                unimplemented!()
+                trace!("ptr={}: not", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+
+                // XXX possibly wrong?
+                let b = !b % 32768;
+                self.registers[a as usize] = b;
+
+                self.ptr += 4;
+
+                todo!()
             }
             15 => {
                 // rmem: 15 a b
                 // read memory at address <b> and write it to <a>
-                unimplemented!()
+                trace!("ptr={}: rmem", self.ptr);
+
+                let a = self.get_register(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+
+                let num = self.get_ram(b);
+
+                self.registers[a as usize] = num;
+
+                self.ptr += 6;
             }
             16 => {
                 // wmem: 16 a b
                 // write the value from <b> into memory at address <a>
-                unimplemented!()
+                trace!("ptr={}: wmem", self.ptr);
+
+                let a = self.get_value(self.ptr + 2);
+                let b = self.get_value(self.ptr + 4);
+
+                // this is how we made a big number
+                // (high << 8) + low
+
+                let high = b >> 8;
+                let low = b % 256;
+
+                self.ram[a as usize] = high as u8;
+                self.ram[(a + 1) as usize] = low as u8;
+
+                self.ptr += 6;
             }
             17 => {
                 // call: 17 a
                 // write the address of the next instruction to the stack and
                 // jump to <a>
                 trace!("ptr={}: call", self.ptr);
-                unimplemented!()
+
+                let a = self.get_value(self.ptr + 2);
+                self.push_stack(self.ptr + 4);
+
+                self.jump(a);
             }
             18 => {
                 // ret: 18
                 // remove the top element from the stack and jump to it; empty
                 // stack = halt
                 trace!("ptr={}: ret", self.ptr);
-                unimplemented!()
+
+                let ptr = self.pop_stack();
+                self.jump(ptr);
             }
             19 => {
                 // out: 19 a
@@ -162,7 +371,8 @@ impl VM {
                 trace!("ptr={}: out", self.ptr);
 
                 let a = self.get_value(self.ptr + 2);
-                print!("{}", a as u8 as char);
+                eprint!("{}", a as u8 as char);
+                trace!("output: {}", a);
 
                 self.ptr += 4;
             }
@@ -185,6 +395,7 @@ impl VM {
             }
             n => {
                 // uh oh
+                self.dump_state();
                 panic!("unknown instruction: {}", n);
             }
         }
@@ -200,9 +411,7 @@ fn main() {
     let binary = fs::read(bin_file).unwrap();
     let mut vm = VM::new(binary);
 
-//    vm.dump_state();
     loop {
         vm.step();
-//        vm.dump_state();
     }
 }
