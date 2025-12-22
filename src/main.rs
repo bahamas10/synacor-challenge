@@ -9,12 +9,13 @@
 use log::{debug, trace};
 use std::env;
 use std::fs;
+use std::io::{self, Read, Write};
 
 #[derive(Default)]
 struct VM {
     ram: Vec<u8>,
     registers: [u16; 8],
-    ptr: u16,
+    addr: u16, // addr pointer
     stack: Vec<u16>,
     running: bool,
 }
@@ -28,6 +29,10 @@ enum ValueType {
 impl VM {
     fn new(rom: Vec<u8>) -> Self {
         Self { ram: rom, running: true, ..Default::default() }
+    }
+
+    fn is_halted(&self) -> bool {
+        !self.running
     }
 
     fn push_stack(&mut self, value: u16) {
@@ -45,12 +50,13 @@ impl VM {
             println!("register {}: {}", i, register);
         }
         // TODO dump stack
-        println!("running={}, ptr={}", self.running, self.ptr);
+        println!("running={}, addr={}", self.running, self.addr);
     }
 
-    fn get_ram(&self, ptr: u16) -> u16 {
-        let low = self.ram[ptr as usize] as u16;
-        let high = self.ram[ptr as usize + 1] as u16;
+    fn get_ram(&self, addr: u16) -> u16 {
+        let ptr = (addr * 2) as usize;
+        let low = self.ram[ptr] as u16;
+        let high = self.ram[ptr + 1] as u16;
 
         let num = (high << 8) + low;
         trace!(
@@ -62,8 +68,8 @@ impl VM {
     }
 
     // get the raw number from the rom
-    fn get_ram_value(&self, ptr: u16) -> ValueType {
-        let num = self.get_ram(ptr);
+    fn get_ram_value(&self, addr: u16) -> ValueType {
+        let num = self.get_ram(addr);
 
         if num < 32768 {
             // it's a literal value
@@ -73,22 +79,22 @@ impl VM {
             ValueType::Register(num % 32768)
         } else {
             // it's invalid
-            panic!("get_value found invalid number at ptr {}: {}", ptr, num);
+            panic!("get_value found invalid number at addr {}: {}", addr, num);
         }
     }
 
-    // get the register at the pointer - fails if not a register
-    fn get_register(&self, ptr: u16) -> u16 {
-        match self.get_ram_value(ptr) {
+    // get the register at the address - fails if not a register
+    fn get_register(&self, addr: u16) -> u16 {
+        match self.get_ram_value(addr) {
             ValueType::Register(n) => n,
             ValueType::Literal(_) => panic!(),
         }
     }
 
-    // get the value at the pointer - either grabbing the literal value or
+    // get the value at the address - either grabbing the literal value or
     // traversing into the register itself and using that value
-    fn get_value(&self, ptr: u16) -> u16 {
-        match self.get_ram_value(ptr) {
+    fn get_value(&self, addr: u16) -> u16 {
+        match self.get_ram_value(addr) {
             ValueType::Register(r) => self.registers[r as usize],
             ValueType::Literal(n) => n,
         }
@@ -96,70 +102,69 @@ impl VM {
 
     // jump to an ADDRESS
     fn jump(&mut self, addr: u16) {
-        let ptr = addr * 2;
-        debug!("self.jump: jumping to addr {} (ptr={})", addr, ptr);
-        self.ptr = ptr;
+        debug!("self.jump: jumping to addr {}", addr);
+        self.addr = addr;
     }
 
     fn step(&mut self) {
         assert!(self.running, "tried to step while halted");
 
         // grab the instruction to process
-        let instruction = self.get_value(self.ptr);
+        let instruction = self.get_value(self.addr);
 
         match instruction {
             0 => {
                 // halt
                 // stop execution and terminate the program
-                trace!("ptr={}: halt", self.ptr);
+                debug!("instruction: {} (addr={})", "halt", self.addr);
 
                 self.running = false;
             }
             1 => {
                 // set: 1 a b
                 // set register <a> to the value of <b>
-                trace!("ptr={}: set", self.ptr);
+                debug!("instruction: {} (addr={})", "set", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
 
                 self.registers[a as usize] = b;
 
                 debug!("set reg {} to {}", a, b);
 
-                self.ptr += 6;
+                self.addr += 3;
             }
             2 => {
                 // push: 2 a
                 // push <a> onto the stack
-                trace!("ptr={}: push", self.ptr);
+                debug!("instruction: {} (addr={})", "push", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
+                let a = self.get_value(self.addr + 1);
                 self.push_stack(a);
 
-                self.ptr += 4;
+                self.addr += 2;
             }
             3 => {
                 // pop: 3 a
                 // remove the top element from the stack and write it into <a>;
                 // empty stack = error
-                trace!("ptr={}: push", self.ptr);
+                debug!("instruction: {} (addr={})", "pop", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
+                let a = self.get_register(self.addr + 1);
                 let elem = self.pop_stack();
 
                 self.registers[a as usize] = elem;
 
-                self.ptr += 4;
+                self.addr += 2;
             }
             4 => {
                 // eq: 4 a b c
                 // set <a> to 1 if <b> is equal to <c>; set it to 0 otherwise
-                trace!("ptr={}: eq", self.ptr);
+                debug!("instruction: {} (addr={})", "eq", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
                 if b == c {
                     self.registers[a as usize] = 1;
@@ -167,16 +172,16 @@ impl VM {
                     self.registers[a as usize] = 0;
                 }
 
-                self.ptr += 8;
+                self.addr += 4;
             }
             5 => {
                 // gt: 5 a b c
                 // set <a> to 1 if <b> is greater than <c>; set it to 0 otherwise
-                trace!("ptr={}: gt", self.ptr);
+                debug!("instruction: {} (addr={})", "gt", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
                 if b > c {
                     self.registers[a as usize] = 1;
@@ -184,154 +189,158 @@ impl VM {
                     self.registers[a as usize] = 0;
                 }
 
-                self.ptr += 8;
+                self.addr += 4;
             }
             6 => {
                 // jmp: 6 a
                 // jump to <a>
-                trace!("ptr={}: jmp", self.ptr);
+                debug!("instruction: {} (addr={})", "jmp", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
+                let a = self.get_value(self.addr + 1);
 
                 self.jump(a);
             }
             7 => {
                 // jt: 7 a b
                 // if <a> is nonzero, jump to <b>
-                trace!("ptr={}: jt", self.ptr);
+                debug!("instruction: {} (addr={})", "jt", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
+                let a = self.get_value(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+
+                trace!("jt: a={}, b={}", a, b);
 
                 if a != 0 {
                     debug!("jt jumped to {}", b);
-                    self.jump(a);
+                    self.jump(b);
                 } else {
-                    self.ptr += 6;
+                    debug!("jt didn't jump");
+                    self.addr += 3;
                 }
             }
             8 => {
                 // jf: 8 a b
                 // if <a> is zero, jump to <b>
-                trace!("ptr={}: jf", self.ptr);
+                debug!("instruction: {} (addr={})", "jf", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
+                let a = self.get_value(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+
+                trace!("jf: a={}, b={}", a, b);
 
                 if a == 0 {
                     debug!("jf jumped to {}", b);
                     self.jump(b);
                 } else {
-                    self.ptr += 6;
+                    debug!("jf didn't jump");
+                    self.addr += 3;
                 }
             }
             9 => {
                 // add: 9 a b c
                 // assign into <a> the sum of <b> and <c> (modulo 32768)
-                trace!("ptr={}: add", self.ptr);
+                debug!("instruction: {} (addr={})", "add", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
                 let sum = (b + c) % 32768;
                 self.registers[a as usize] = sum;
 
-                self.ptr += 6;
+                self.addr += 4;
             }
             10 => {
                 // mult: 10 a b c
                 // store into <a> the product of <b> and <c> (modulo 32768)
-                trace!("ptr={}: mult", self.ptr);
+                debug!("instruction: {} (addr={})", "mult", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
-                let sum = (b * c) % 32768;
-                self.registers[a as usize] = sum;
+                let sum = (b as u32 * c as u32) % 32768;
+                self.registers[a as usize] = sum as u16;
 
-                self.ptr += 6;
+                self.addr += 4;
             }
             11 => {
                 // mod: 11 a b c
                 // store into <a> the remainder of <b> divided by <c>
-                trace!("ptr={}: mod", self.ptr);
+                debug!("instruction: {} (addr={})", "mod", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
                 let sum = (b % c) % 32768;
                 self.registers[a as usize] = sum;
 
-                self.ptr += 6;
+                self.addr += 4;
             }
             12 => {
                 // and: 12 a b c
                 // stores into <a> the bitwise and of <b> and <c>
-                trace!("ptr={}: and", self.ptr);
+                debug!("instruction: {} (addr={})", "and", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
                 let sum = (b & c) % 32768;
                 self.registers[a as usize] = sum;
 
-                self.ptr += 6;
+                self.addr += 4;
             }
             13 => {
                 // or: 13 a b c
                 // stores into <a> the bitwise or of <b> and <c>
-                trace!("ptr={}: or", self.ptr);
+                debug!("instruction: {} (addr={})", "or", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
-                let c = self.get_value(self.ptr + 6);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
+                let c = self.get_value(self.addr + 3);
 
                 let sum = (b | c) % 32768;
                 self.registers[a as usize] = sum;
 
-                self.ptr += 6;
+                self.addr += 4;
             }
             14 => {
                 // not: 14 a b
                 // stores 15-bit bitwise inverse of <b> in <a>
-                trace!("ptr={}: not", self.ptr);
+                debug!("instruction: {} (addr={})", "not", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
 
                 // XXX possibly wrong?
                 let b = !b % 32768;
                 self.registers[a as usize] = b;
 
-                self.ptr += 4;
-
-                todo!()
+                self.addr += 3;
             }
             15 => {
                 // rmem: 15 a b
                 // read memory at address <b> and write it to <a>
-                trace!("ptr={}: rmem", self.ptr);
+                debug!("instruction: {} (addr={})", "rmem", self.addr);
 
-                let a = self.get_register(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
+                let a = self.get_register(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
 
                 let num = self.get_ram(b);
 
                 self.registers[a as usize] = num;
 
-                self.ptr += 6;
+                self.addr += 3;
             }
             16 => {
                 // wmem: 16 a b
                 // write the value from <b> into memory at address <a>
-                trace!("ptr={}: wmem", self.ptr);
+                debug!("instruction: {} (addr={})", "wmem", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
-                let b = self.get_value(self.ptr + 4);
+                let a = self.get_value(self.addr + 1);
+                let b = self.get_value(self.addr + 2);
 
                 // this is how we made a big number
                 // (high << 8) + low
@@ -339,19 +348,22 @@ impl VM {
                 let high = b >> 8;
                 let low = b % 256;
 
-                self.ram[a as usize] = high as u8;
-                self.ram[(a + 1) as usize] = low as u8;
+                trace!("setting value {} into ram memory addr {}", b, a);
+                trace!("self.ram[({} * 2)] = {}", a, high);
+                trace!("self.ram[({} * 2) + 1] = {}", a, low);
+                self.ram[(a * 2) as usize] = low as u8;
+                self.ram[(a * 2) as usize + 1] = high as u8;
 
-                self.ptr += 6;
+                self.addr += 3;
             }
             17 => {
                 // call: 17 a
                 // write the address of the next instruction to the stack and
                 // jump to <a>
-                trace!("ptr={}: call", self.ptr);
+                debug!("instruction: {} (addr={})", "call", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
-                self.push_stack(self.ptr + 4);
+                let a = self.get_value(self.addr + 1);
+                self.push_stack(self.addr + 2);
 
                 self.jump(a);
             }
@@ -359,22 +371,22 @@ impl VM {
                 // ret: 18
                 // remove the top element from the stack and jump to it; empty
                 // stack = halt
-                trace!("ptr={}: ret", self.ptr);
+                debug!("instruction: {} (addr={})", "ret", self.addr);
 
-                let ptr = self.pop_stack();
-                self.jump(ptr);
+                let addr = self.pop_stack();
+                self.jump(addr);
             }
             19 => {
                 // out: 19 a
                 // write the character represented by ascii code <a> to the
                 // terminal
-                trace!("ptr={}: out", self.ptr);
+                debug!("instruction: {} (addr={})", "out", self.addr);
 
-                let a = self.get_value(self.ptr + 2);
+                let a = self.get_value(self.addr + 1);
                 eprint!("{}", a as u8 as char);
                 trace!("output: {}", a);
 
-                self.ptr += 4;
+                self.addr += 2;
             }
             20 => {
                 // in: 20 a
@@ -384,14 +396,26 @@ impl VM {
                 // that you can safely read whole lines from the keyboard
                 // instead of having to figure out how to read individual
                 // characters
-                trace!("ptr={}: in", self.ptr);
-                unimplemented!()
+                debug!("instruction: {} (addr={})", "in", self.addr);
+
+                let a = self.get_register(self.addr + 1);
+
+                // read a single character
+                let mut buf: [u8; 1] = [0u8];
+                io::stdin()
+                    .read_exact(&mut buf)
+                    .expect("failed to read 1 char");
+                let c = buf[0];
+
+                self.registers[a as usize] = c as u16;
+
+                self.addr += 2;
             }
             21 => {
                 // no-op
                 // no operation
-                trace!("ptr={}: no op", self.ptr);
-                self.ptr += 2;
+                debug!("instruction: {} (addr={})", "no-op", self.addr);
+                self.addr += 1;
             }
             n => {
                 // uh oh
@@ -403,7 +427,9 @@ impl VM {
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::builder()
+        .format(|buf, record| writeln!(buf, "> {}", record.args()))
+        .init();
 
     let args: Vec<_> = env::args().skip(1).collect();
     let bin_file = &args[0];
@@ -411,7 +437,9 @@ fn main() {
     let binary = fs::read(bin_file).unwrap();
     let mut vm = VM::new(binary);
 
-    loop {
+    while !vm.is_halted() {
         vm.step();
     }
+
+    println!("VM finished");
 }
