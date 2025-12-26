@@ -6,7 +6,7 @@
  * License: MIT
  */
 
-use log::{debug, trace};
+use log::{debug, info, trace};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -18,6 +18,7 @@ struct VM {
     addr: u16, // addr pointer
     stack: Vec<u16>,
     running: bool,
+    pub input_buffer: Vec<u8>,
 }
 
 enum ValueType {
@@ -49,7 +50,9 @@ impl VM {
         for (i, register) in self.registers.iter().enumerate() {
             println!("register {}: {}", i, register);
         }
-        // TODO dump stack
+        for (i, value) in self.stack.iter().enumerate() {
+            println!("stack {}: {}", i, value);
+        }
         println!("running={}, addr={}", self.running, self.addr);
     }
 
@@ -95,9 +98,18 @@ impl VM {
     // traversing into the register itself and using that value
     fn get_value(&self, addr: u16) -> u16 {
         match self.get_ram_value(addr) {
-            ValueType::Register(r) => self.registers[r as usize],
+            ValueType::Register(r) => {
+                info!("register {} read: {}", r, self.registers[r as usize]);
+                self.registers[r as usize]
+            }
             ValueType::Literal(n) => n,
         }
+    }
+
+    // set a register to a value
+    fn set_register(&mut self, register: u16, value: u16) {
+        info!("register {} write: {}", register, value);
+        self.registers[register as usize] = value;
     }
 
     // jump to an ADDRESS
@@ -128,7 +140,7 @@ impl VM {
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
-                self.registers[a as usize] = b;
+                self.set_register(a, b);
 
                 debug!("set reg {} to {}", a, b);
 
@@ -153,7 +165,7 @@ impl VM {
                 let a = self.get_register(self.addr + 1);
                 let elem = self.pop_stack();
 
-                self.registers[a as usize] = elem;
+                self.set_register(a, elem);
 
                 self.addr += 2;
             }
@@ -167,9 +179,9 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 if b == c {
-                    self.registers[a as usize] = 1;
+                    self.set_register(a, 1);
                 } else {
-                    self.registers[a as usize] = 0;
+                    self.set_register(a, 0);
                 }
 
                 self.addr += 4;
@@ -184,9 +196,9 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 if b > c {
-                    self.registers[a as usize] = 1;
+                    self.set_register(a, 1);
                 } else {
-                    self.registers[a as usize] = 0;
+                    self.set_register(a, 0);
                 }
 
                 self.addr += 4;
@@ -246,7 +258,7 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 let sum = (b + c) % 32768;
-                self.registers[a as usize] = sum;
+                self.set_register(a, sum);
 
                 self.addr += 4;
             }
@@ -260,7 +272,7 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 let sum = (b as u32 * c as u32) % 32768;
-                self.registers[a as usize] = sum as u16;
+                self.set_register(a, sum as u16);
 
                 self.addr += 4;
             }
@@ -274,7 +286,7 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 let sum = (b % c) % 32768;
-                self.registers[a as usize] = sum;
+                self.set_register(a, sum);
 
                 self.addr += 4;
             }
@@ -288,7 +300,7 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 let sum = (b & c) % 32768;
-                self.registers[a as usize] = sum;
+                self.set_register(a, sum);
 
                 self.addr += 4;
             }
@@ -302,7 +314,7 @@ impl VM {
                 let c = self.get_value(self.addr + 3);
 
                 let sum = (b | c) % 32768;
-                self.registers[a as usize] = sum;
+                self.set_register(a, sum);
 
                 self.addr += 4;
             }
@@ -314,9 +326,8 @@ impl VM {
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
-                // XXX possibly wrong?
                 let b = !b % 32768;
-                self.registers[a as usize] = b;
+                self.set_register(a, b);
 
                 self.addr += 3;
             }
@@ -330,7 +341,7 @@ impl VM {
 
                 let num = self.get_ram(b);
 
-                self.registers[a as usize] = num;
+                self.set_register(a, num);
 
                 self.addr += 3;
             }
@@ -400,14 +411,34 @@ impl VM {
 
                 let a = self.get_register(self.addr + 1);
 
-                // read a single character
-                let mut buf: [u8; 1] = [0u8];
-                io::stdin()
-                    .read_exact(&mut buf)
-                    .expect("failed to read 1 char");
-                let c = buf[0];
+                // read a single character - try from input buffer and fallback
+                // to stdin
+                let (c, color) = if !self.input_buffer.is_empty() {
+                    // input buffer
+                    (self.input_buffer.remove(0), 31)
+                } else {
+                    // stdin
+                    let mut buf: [u8; 1] = [0u8];
+                    io::stdin()
+                        .read_exact(&mut buf)
+                        .expect("failed to read 1 char");
 
-                self.registers[a as usize] = c as u16;
+                    // allow user to send commands to the VM itself
+                    if buf[0] == b'/' {
+                        let mut cmd = String::new();
+                        io::stdin().read_line(&mut cmd).unwrap();
+                        let cmd = cmd.trim();
+
+                        self.process_internal_command(cmd);
+                        return;
+                    }
+
+                    (buf[0], 32)
+                };
+
+                eprint!("\x1b[{}m{}\x1b[0m", color, c as char);
+
+                self.set_register(a, c as u16);
 
                 self.addr += 2;
             }
@@ -424,6 +455,24 @@ impl VM {
             }
         }
     }
+
+    fn process_internal_command(&mut self, s: &str) {
+        debug!("internal command: {}", s);
+
+        let cmd: Vec<_> = s.split_whitespace().collect();
+
+        match cmd[0] {
+            "dump" => self.dump_state(),
+            "set" => {
+                // set the register
+                let register: u16 = cmd[1].parse().unwrap();
+                let value: u16 = cmd[2].parse().unwrap();
+                println!("updating register {}: {}", register, value);
+                self.set_register(register, value);
+            }
+            cmd => panic!("unknown internal command: {}", cmd),
+        }
+    }
 }
 
 fn main() {
@@ -436,6 +485,12 @@ fn main() {
 
     let binary = fs::read(bin_file).unwrap();
     let mut vm = VM::new(binary);
+
+    // command file given as arg2
+    if let Some(f) = args.get(1) {
+        let input_buffer = fs::read(f).unwrap();
+        vm.input_buffer = input_buffer;
+    }
 
     while !vm.is_halted() {
         vm.step();
