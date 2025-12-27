@@ -7,17 +7,19 @@
  */
 
 use log::{debug, info, trace};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct VM {
     ram: Vec<u8>,
     registers: [u16; 8],
     addr: u16, // addr pointer
     stack: Vec<u16>,
     running: bool,
+    level: usize,
     pub input_buffer: Vec<u8>,
 }
 
@@ -37,7 +39,7 @@ impl VM {
     }
 
     fn push_stack(&mut self, value: u16) {
-        debug!("pushing {} onto the stack", value);
+        trace!("pushing {} onto the stack", value);
         self.stack.push(value);
     }
 
@@ -99,7 +101,10 @@ impl VM {
     fn get_value(&self, addr: u16) -> u16 {
         match self.get_ram_value(addr) {
             ValueType::Register(r) => {
-                info!("register {} read: {}", r, self.registers[r as usize]);
+                info!(
+                    "(addr={}) register {} read: {}",
+                    addr, r, self.registers[r as usize]
+                );
                 self.registers[r as usize]
             }
             ValueType::Literal(n) => n,
@@ -108,14 +113,19 @@ impl VM {
 
     // set a register to a value
     fn set_register(&mut self, register: u16, value: u16) {
-        info!("register {} write: {}", register, value);
+        //info!("register {} write: {}", register, value);
         self.registers[register as usize] = value;
     }
 
     // jump to an ADDRESS
     fn jump(&mut self, addr: u16) {
-        debug!("self.jump: jumping to addr {}", addr);
+        trace!("self.jump: jumping to addr {}", addr);
         self.addr = addr;
+    }
+
+    fn log_assembly(&self, op: &str) {
+        let w = self.level;
+        debug!("{} {:<w$} {}", " ", self.addr, op);
     }
 
     fn step(&mut self) {
@@ -128,30 +138,28 @@ impl VM {
             0 => {
                 // halt
                 // stop execution and terminate the program
-                debug!("instruction: {} (addr={})", "halt", self.addr);
+                self.log_assembly("halt");
 
                 self.running = false;
             }
             1 => {
                 // set: 1 a b
                 // set register <a> to the value of <b>
-                debug!("instruction: {} (addr={})", "set", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
-                self.set_register(a, b);
+                self.log_assembly(&format!("set <{}> = {}", a, b));
 
-                debug!("set reg {} to {}", a, b);
+                self.set_register(a, b);
 
                 self.addr += 3;
             }
             2 => {
                 // push: 2 a
                 // push <a> onto the stack
-                debug!("instruction: {} (addr={})", "push", self.addr);
-
                 let a = self.get_value(self.addr + 1);
+                self.log_assembly(&format!("push {}", a));
+
                 self.push_stack(a);
 
                 self.addr += 2;
@@ -160,10 +168,13 @@ impl VM {
                 // pop: 3 a
                 // remove the top element from the stack and write it into <a>;
                 // empty stack = error
-                debug!("instruction: {} (addr={})", "pop", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let elem = self.pop_stack();
+
+                self.log_assembly(&format!(
+                    "pop writing {} into <{}>",
+                    elem, a
+                ));
 
                 self.set_register(a, elem);
 
@@ -172,11 +183,11 @@ impl VM {
             4 => {
                 // eq: 4 a b c
                 // set <a> to 1 if <b> is equal to <c>; set it to 0 otherwise
-                debug!("instruction: {} (addr={})", "eq", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("eq ({} == {})", b, c));
 
                 if b == c {
                     self.set_register(a, 1);
@@ -189,11 +200,11 @@ impl VM {
             5 => {
                 // gt: 5 a b c
                 // set <a> to 1 if <b> is greater than <c>; set it to 0 otherwise
-                debug!("instruction: {} (addr={})", "gt", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("gt ({} > {})", b, c));
 
                 if b > c {
                     self.set_register(a, 1);
@@ -206,56 +217,53 @@ impl VM {
             6 => {
                 // jmp: 6 a
                 // jump to <a>
-                debug!("instruction: {} (addr={})", "jmp", self.addr);
-
                 let a = self.get_value(self.addr + 1);
+                self.log_assembly(&format!("jmp <{}>", a));
 
                 self.jump(a);
             }
             7 => {
                 // jt: 7 a b
                 // if <a> is nonzero, jump to <b>
-                debug!("instruction: {} (addr={})", "jt", self.addr);
-
                 let a = self.get_value(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
                 trace!("jt: a={}, b={}", a, b);
+                self.log_assembly(&format!("jt ({} != 0 -> {})", a, b));
 
                 if a != 0 {
-                    debug!("jt jumped to {}", b);
+                    trace!("jt jumped to {}", b);
                     self.jump(b);
                 } else {
-                    debug!("jt didn't jump");
+                    trace!("jt didn't jump");
                     self.addr += 3;
                 }
             }
             8 => {
                 // jf: 8 a b
                 // if <a> is zero, jump to <b>
-                debug!("instruction: {} (addr={})", "jf", self.addr);
-
                 let a = self.get_value(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
                 trace!("jf: a={}, b={}", a, b);
+                self.log_assembly(&format!("jf ({} == 0 -> {})", a, b));
 
                 if a == 0 {
-                    debug!("jf jumped to {}", b);
+                    trace!("jf jumped to {}", b);
                     self.jump(b);
                 } else {
-                    debug!("jf didn't jump");
+                    trace!("jf didn't jump");
                     self.addr += 3;
                 }
             }
             9 => {
                 // add: 9 a b c
                 // assign into <a> the sum of <b> and <c> (modulo 32768)
-                debug!("instruction: {} (addr={})", "add", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("add <{}> = {} + {}", a, b, c));
 
                 let sum = (b + c) % 32768;
                 self.set_register(a, sum);
@@ -265,11 +273,11 @@ impl VM {
             10 => {
                 // mult: 10 a b c
                 // store into <a> the product of <b> and <c> (modulo 32768)
-                debug!("instruction: {} (addr={})", "mult", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("mult <{}> = {} * {}", a, b, c));
 
                 let sum = (b as u32 * c as u32) % 32768;
                 self.set_register(a, sum as u16);
@@ -279,11 +287,11 @@ impl VM {
             11 => {
                 // mod: 11 a b c
                 // store into <a> the remainder of <b> divided by <c>
-                debug!("instruction: {} (addr={})", "mod", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("mod <{}> = {} % {}", a, b, c));
 
                 let sum = (b % c) % 32768;
                 self.set_register(a, sum);
@@ -293,11 +301,11 @@ impl VM {
             12 => {
                 // and: 12 a b c
                 // stores into <a> the bitwise and of <b> and <c>
-                debug!("instruction: {} (addr={})", "and", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("and <{}> = {} & {}", a, b, c));
 
                 let sum = (b & c) % 32768;
                 self.set_register(a, sum);
@@ -307,11 +315,11 @@ impl VM {
             13 => {
                 // or: 13 a b c
                 // stores into <a> the bitwise or of <b> and <c>
-                debug!("instruction: {} (addr={})", "or", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
                 let c = self.get_value(self.addr + 3);
+
+                self.log_assembly(&format!("or <{}> = {} | {}", a, b, c));
 
                 let sum = (b | c) % 32768;
                 self.set_register(a, sum);
@@ -321,10 +329,10 @@ impl VM {
             14 => {
                 // not: 14 a b
                 // stores 15-bit bitwise inverse of <b> in <a>
-                debug!("instruction: {} (addr={})", "not", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
+
+                self.log_assembly(&format!("not <{}> = ~{}", a, b));
 
                 let b = !b % 32768;
                 self.set_register(a, b);
@@ -334,12 +342,12 @@ impl VM {
             15 => {
                 // rmem: 15 a b
                 // read memory at address <b> and write it to <a>
-                debug!("instruction: {} (addr={})", "rmem", self.addr);
-
                 let a = self.get_register(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
                 let num = self.get_ram(b);
+
+                self.log_assembly(&format!("rmem <{}> = {}", a, num));
 
                 self.set_register(a, num);
 
@@ -348,8 +356,6 @@ impl VM {
             16 => {
                 // wmem: 16 a b
                 // write the value from <b> into memory at address <a>
-                debug!("instruction: {} (addr={})", "wmem", self.addr);
-
                 let a = self.get_value(self.addr + 1);
                 let b = self.get_value(self.addr + 2);
 
@@ -362,6 +368,9 @@ impl VM {
                 trace!("setting value {} into ram memory addr {}", b, a);
                 trace!("self.ram[({} * 2)] = {}", a, high);
                 trace!("self.ram[({} * 2) + 1] = {}", a, low);
+
+                self.log_assembly(&format!("wmem {} = {}", a, b));
+
                 self.ram[(a * 2) as usize] = low as u8;
                 self.ram[(a * 2) as usize + 1] = high as u8;
 
@@ -371,27 +380,39 @@ impl VM {
                 // call: 17 a
                 // write the address of the next instruction to the stack and
                 // jump to <a>
-                debug!("instruction: {} (addr={})", "call", self.addr);
 
                 let a = self.get_value(self.addr + 1);
+
+                self.log_assembly(&format!("call {}", a));
+
+                if a == 6049 {
+                    // LOL - game genie
+                    /*
+                    self.registers[0] = 6;
+                    self.addr += 2;
+                    return;
+                    */
+                }
+
                 self.push_stack(self.addr + 2);
 
+                self.level += 1;
                 self.jump(a);
             }
             18 => {
                 // ret: 18
                 // remove the top element from the stack and jump to it; empty
                 // stack = halt
-                debug!("instruction: {} (addr={})", "ret", self.addr);
-
                 let addr = self.pop_stack();
+                self.log_assembly(&format!("ret ({})", addr));
+                self.level -= 1;
                 self.jump(addr);
             }
             19 => {
                 // out: 19 a
                 // write the character represented by ascii code <a> to the
                 // terminal
-                debug!("instruction: {} (addr={})", "out", self.addr);
+                self.log_assembly("out");
 
                 let a = self.get_value(self.addr + 1);
                 eprint!("{}", a as u8 as char);
@@ -407,7 +428,7 @@ impl VM {
                 // that you can safely read whole lines from the keyboard
                 // instead of having to figure out how to read individual
                 // characters
-                debug!("instruction: {} (addr={})", "in", self.addr);
+                self.log_assembly("in");
 
                 let a = self.get_register(self.addr + 1);
 
@@ -445,7 +466,7 @@ impl VM {
             21 => {
                 // no-op
                 // no operation
-                debug!("instruction: {} (addr={})", "no-op", self.addr);
+                self.log_assembly("no-op");
                 self.addr += 1;
             }
             n => {
@@ -457,7 +478,7 @@ impl VM {
     }
 
     fn process_internal_command(&mut self, s: &str) {
-        debug!("internal command: {}", s);
+        trace!("internal command: {}", s);
 
         let cmd: Vec<_> = s.split_whitespace().collect();
 
@@ -470,6 +491,25 @@ impl VM {
                 println!("updating register {}: {}", register, value);
                 self.set_register(register, value);
             }
+            "save" => {
+                let file = cmd[1];
+                if fs::exists(file).unwrap() {
+                    println!("file already exists, doing nothing");
+                    return;
+                }
+                fs::write(file, &self.ram).unwrap();
+                println!("file saved to {}", file);
+            }
+            "export" => {
+                let file = cmd[1];
+                if fs::exists(file).unwrap() {
+                    println!("file already exists, doing nothing");
+                    return;
+                }
+                let data = serde_json::to_string(&self).unwrap();
+                fs::write(file, &data).unwrap();
+                println!("file saved to {}", file);
+            }
             cmd => panic!("unknown internal command: {}", cmd),
         }
     }
@@ -481,10 +521,16 @@ fn main() {
         .init();
 
     let args: Vec<_> = env::args().skip(1).collect();
-    let bin_file = &args[0];
 
-    let binary = fs::read(bin_file).unwrap();
-    let mut vm = VM::new(binary);
+    let file = &args[0];
+
+    let mut vm = if file.ends_with(".json") {
+        let data = fs::read_to_string(file).unwrap();
+        serde_json::from_str(&data).unwrap()
+    } else {
+        let binary = fs::read(file).unwrap();
+        VM::new(binary)
+    };
 
     // command file given as arg2
     if let Some(f) = args.get(1) {
